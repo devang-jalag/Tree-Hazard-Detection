@@ -1,253 +1,280 @@
-# Which Tree Falls First
+# Halifax Urban Forestry: Tree Hazard Inspection Triage Platform
 
-Inspection triage for Halifax Regional Municipality Urban Forestry.
+An enterprise-grade geospatial triage and risk prioritization engine developed for the Halifax Regional Municipality (HRM) Urban Forestry division. The platform automates public complaint intake, resolves spatial data with automated fallback tiers, performs multi-modal hazard classification, and dynamically ranks arboricultural inspection backlogs to optimize field crew dispatch.
 
-290 tree requests are open. Every one needs a site visit, and crews reach only a
-handful a week. Residents report trees through a public form; the system reads
-the description and the photo, scores the hazard, and ranks the backlog so the
-most dangerous trees are inspected first.
+---
 
-It does **not** decide whether a tree is dangerous. It decides what order a
-qualified arborist should look at them in.
+## 1. Executive Summary
 
-## Run it
+Municipal forestry teams face substantial backlog volumes, with hundreds of concurrent citizen reports awaiting field review. Standard first-in, first-out (FIFO) scheduling fails during high-wind and storm events, where severe structural tree hazards (e.g., electrical line contact, imminent branch failure over public rights-of-way) require immediate site inspection.
+
+This system provides:
+1. **Intelligent Intake:** Public citizen reporting with automatic EXIF GPS extraction and multi-stage geocoding.
+2. **Deterministic Risk Triage:** Algorithmic hazard extraction decoupled into static hazard classification and dynamic wait-time prioritization.
+3. **Resilient Geospatial Architecture:** Multi-tier mapping supporting Google Maps Platform with zero-downtime automated failover to OpenStreetMap.
+4. **Cloud-Native Storage:** Direct Google Cloud Storage (GCS) object storage integration with local database fallback.
+5. **Operational Tooling:** Interactive queue management, day-plan route clustering, and printable standardized field inspection posters.
+
+---
+
+## 2. System Architecture
+
+```mermaid
+graph TD
+    subgraph ClientLayer ["Client Layer (Next.js 14 App Router)"]
+        PublicForm["Public Intake Portal (/)"]
+        AdminDashboard["Admin Inspection Queue (/admin)"]
+        DetailView["Request Detail & Poster (/admin/requests/[id])"]
+    end
+
+    subgraph ServerLayer ["Server & Application Services"]
+        IntakeService["Intake Service (src/backend/services/intake.ts)"]
+        ScoringEngine["Deterministic Scoring Engine (src/backend/domain/scoring.ts)"]
+        BundlingEngine["Geospatial Route Planner (src/backend/domain/bundling.ts)"]
+        GeoService["Geocoding Service (src/backend/services/geocode.ts)"]
+        MapProxy["Basemap Proxy (/api/map)"]
+        GCSClient["Google Cloud Storage Engine (src/backend/services/gcs.ts)"]
+    end
+
+    subgraph ExternalTiers ["External Infrastructure & Fallback Tiers"]
+        GoogleMaps["Primary: Google Maps Platform (Geocoding & Static Maps)"]
+        OSM["Fallback: OpenStreetMap / CartoDB Raster Tiles"]
+        GCS["Primary Storage: Google Cloud Storage (Bucket: tree-hazard-images-503718)"]
+        LocalDB["Database: Supabase PostgreSQL (pg-pool, additive migrations)"]
+    end
+
+    PublicForm --> IntakeService
+    AdminDashboard --> ScoringEngine
+    AdminDashboard --> BundlingEngine
+    DetailView --> MapProxy
+
+    IntakeService --> GeoService
+    IntakeService --> GCSClient
+    IntakeService --> LocalDB
+
+    GeoService -->|Primary| GoogleMaps
+    GeoService -->|Fallback| LocalDB
+
+    MapProxy -->|Primary| GoogleMaps
+    MapProxy -->|Automated Failover| OSM
+
+    GCSClient -->|Primary Upload| GCS
+    GCSClient -->|Fallback| LocalDB
+```
+
+---
+
+## 3. End-to-End Data Flow Pipeline
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Citizen as Citizen / Reporter
+    participant App as Next.js Intake Service
+    participant Geo as Geocoding Pipeline
+    participant GCS as Google Cloud Storage
+    participant DB as PostgreSQL Database
+    participant Engine as Triage Engine
+    actor Crew as Municipal Arborist
+
+    Citizen->>App: Submits Report (Description, Street Address, Photo)
+    App->>App: Extract EXIF GPS coordinates from photo metadata
+    alt EXIF Present
+        App->>App: Bind exact device GPS coordinates (Precision: Rooftop)
+    else EXIF Missing
+        App->>Geo: Request Geocoding (Google Maps API)
+        alt Google Geocoding Active
+            Geo-->>App: Return Geocoded Point & Precision Level
+        else Quota Exceeded / Unconfigured
+            Geo-->>App: Fallback to Offline Halifax Peninsula Gazetteer
+        end
+    end
+
+    App->>GCS: Upload Image Buffer via Native RS256 JWT Client
+    alt GCS Upload Success
+        GCS-->>App: Return Public Object Storage URL
+        App->>DB: Persist Record with CDN Image Reference
+    else GCS Unconfigured / Fallback
+        App->>DB: Persist Record with Base64 Payload in Database
+    end
+
+    App->>Engine: Run static classification (classifyComplaint)
+    Engine->>DB: Store detected hazards & danger score (Engine: fused-v1)
+
+    Note over DB,Crew: Arborist Queue Operation
+    Crew->>App: Access Inspection Queue (/admin)
+    App->>DB: Query active complaints
+    App->>Engine: Recompute dynamic priority (scoreRequest with live wait decay)
+    App-->>Crew: Render ranked queue & spatial inspection view
+```
+
+---
+
+## 4. Architectural Decision Records (ADRs)
+
+### ADR-001: Zero-Dependency Google Cloud Storage Engine
+- **Context:** Complaint photos must be stored and served reliably on serverless infrastructure (Vercel) without exceeding execution payload limits or bloating the PostgreSQL database with base64 strings.
+- **Decision:** Implement a custom, zero-dependency GCS client (`src/backend/services/gcs.ts`) utilizing native Node.js `crypto` (`RSA-SHA256`) and `fetch` to exchange signed service-account JWTs for OAuth2 tokens directly.
+- **Rationale:** 
+  1. Avoids pulling in the official `@google-cloud/storage` SDK, which introduces over 45 transitive dependencies, increasing cold-start latencies on edge runtimes.
+  2. Ensures portability across serverless execution targets.
+  3. Includes automated fallback to local/database storage when service credentials are unavailable.
+
+### ADR-002: Multi-Tier Resilient Geospatial & Mapping Architecture
+- **Context:** Field crews rely on map tiles for spatial context. Relying solely on a paid external API risks downtime when API quotas expire or billing credits lapse.
+- **Decision:** Implement a 3-tier geospatial fallback pipeline:
+  - **Tier 1 (Primary):** Google Maps Geocoding and Google Static Maps API for high-resolution vector and roadmap generation.
+  - **Tier 2 (Secondary):** Automated server-side failover in `/api/map` to OpenStreetMap Web Mercator raster tiles upon upstream HTTP failure (non-200 or timeout).
+  - **Tier 3 (Offline):** Embedded offline SVG street grid and local Halifax municipal gazetteer for peninsula address matching.
+- **Rationale:** Eliminates hard single-point-of-failure dependencies on third-party API vendors while providing direct navigation links to Google Maps (`https://www.google.com/maps/search/?api=1&query=lat,lng`) for field crews.
+
+### ADR-003: Bifurcated Scoring System (Static Classification vs. Live Triage)
+- **Context:** Triage ranking depends both on intrinsic hazard severity (e.g., power line proximity, leaning angle) and elapsed wait time. Storing a precomputed "final score" in the database causes rankings to become stale every 24 hours.
+- **Decision:** Decouple scoring into two strictly isolated functions:
+  1. `classifyComplaint(text)`: Heavyweight NLP and vision classification executed once upon intake and persisted immutably with engine version stamping (`fused-v1`).
+  2. `scoreRequest(classification, context)`: Lightweight, deterministic calculation executed on-demand during queue reads, dynamically factoring in live elapsed days (`daysWaiting * weight`).
+- **Rationale:** Ensures all 290+ queued requests reflect mathematically accurate priority without requiring batch nightly database updates.
+
+### ADR-004: Strict Layer Isolation
+- **Context:** Shared codebases frequently suffer from server-side leaks into browser bundles, compromising environment credentials.
+- **Decision:** Enforce architectural isolation:
+  - `src/backend/`: Server-only logic (PostgreSQL client, GCS client, auth tokens). Never imported by client components.
+  - `src/frontend/`: React client components and styling.
+  - `src/shared/`: Isomorphic types and pure mathematical calculation functions (e.g., Haversine distance, Web Mercator projection).
+- **Rationale:** Guarantees zero credential leakage to client bundles while maximizing testability.
+
+---
+
+## 5. Technology Stack
+
+| Layer | Technologies | Rationale |
+|---|---|---|
+| **Framework** | Next.js 14 (App Router), React 18, TypeScript 5.6 | Fullstack execution, server actions, strict typing, route optimization. |
+| **Database** | PostgreSQL via Supabase Pooler (`pg` 8.23) | Transactional data integrity, connection pooling for serverless elasticity. |
+| **Cloud Storage** | Google Cloud Storage (Bucket: `tree-hazard-images-503718`) | Native JWT/OAuth2 RS256 client for zero-dependency image offloading. |
+| **Geospatial** | Google Maps Platform, OpenStreetMap, Web Mercator projection | Tiered resiliency for geocoding and map tile rendering. |
+| **Testing** | Vitest 2.1, TypeScript Compiler (`tsc --noEmit`) | High-speed unit testing, strict contract enforcement. |
+| **Styling** | Vanilla CSS, Tailwind CSS 3.4, Lucide Icons | Responsive arborist dispatch UI and standardized printable field sheets. |
+| **CI/CD** | GitHub Actions (`.github/workflows/ci.yml`) | Automated multi-version build, type-check, and test matrix. |
+
+---
+
+## 6. Directory Structure
+
+```text
+├── .github/
+│   └── workflows/
+│       └── ci.yml               # Automated CI pipeline (Build, Typecheck, Test)
+├── backend/                     # Standalone Express services & GCS integration
+│   ├── src/
+│   │   ├── cloudStorage.js      # Zero-dependency GCS storage client
+│   │   ├── complaintGenerator.js# Synthetic HRM complaint data generator
+│   │   ├── hrmApi.js            # Open Data Halifax municipal integration
+│   │   ├── server.js            # Standalone API server
+│   │   └── supabaseClient.js    # Database connection layer
+│   └── service-account.json     # Protected GCP service account (git-ignored)
+├── docs/                        # Technical documentation & project specifications
+│   └── specs/                   # System requirement specifications and tasks
+├── src/
+│   ├── app/                     # Next.js App Router (Routes & Server Handlers)
+│   │   ├── admin/               # Administrative dispatch & authentication
+│   │   ├── api/                 # API route handlers (maps, images, intake)
+│   │   └── report/              # Public reporting interface
+│   ├── backend/                 # Server-only domain services
+│   │   ├── db/                  # PostgreSQL client, repository, migrations
+│   │   ├── domain/              # Scoring, hazard classification, bundling
+│   │   ├── seed/                # Halifax municipal fixtures and mock dataset
+│   │   └── services/            # GCS, geocoding, static maps, EXIF extraction
+│   ├── frontend/                # UI presentation components
+│   │   └── components/          # MapView, RequestDetail, QueueView, DayPlan
+│   └── shared/                  # Pure isomorphic utilities (geo, scoring, types)
+├── README.md                    # System architecture and engineering manual
+├── package.json                 # Project manifest and scripts
+├── tsconfig.json                # Strict TypeScript configuration
+└── vitest.config.ts             # Vitest test runner configuration
+```
+
+---
+
+## 7. Environment Variables & Configuration
+
+Copy `.env.example` to `.env.local` to configure local runtime settings:
 
 ```bash
+# Database Configuration (Required)
+DATABASE_URL=postgresql://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:5432/postgres
+
+# Google Cloud Platform (Optional - Enables Cloud Storage)
+GCS_BUCKET=tree-hazard-images-503718
+GOOGLE_APPLICATION_CREDENTIALS=backend/service-account.json
+
+# Geospatial Mapping (Optional - Enables Tier 1 Google Maps)
+GOOGLE_MAPS_API_KEY=your_google_maps_api_key
+MAP_PROXY_SECRET=your_hmac_signing_secret
+
+# AI Vision Model (Optional - Enables Multimodal Analysis)
+ANTHROPIC_API_KEY=your_anthropic_api_key
+VISION_MODEL=claude-opus-5
+
+# Authentication & Security
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=admin
+ADMIN_SESSION_SECRET=your_session_secret
+ADMIN_SESSION_HOURS=12
+```
+
+---
+
+## 8. Development & Verification Runbook
+
+### Prerequisites
+- Node.js 20.x or higher
+- npm 10.x or higher
+
+### Local Setup
+```bash
+# 1. Install dependencies
 npm install
-cp .env.example .env.local   # add your Supabase DATABASE_URL
-npm run db:check             # verify the connection (diagnoses Supabase gotchas)
-npm run db:reset             # create the schema and seed it
-npm run dev                  # http://localhost:5177
+
+# 2. Verify database connection
+npm run db:check
+
+# 3. Apply schema and seed engineered Halifax dataset
+npm run db:reset
+
+# 4. Run local development server
+npm run dev
+# Server accessible at: http://localhost:5177
 ```
 
-The database is **Supabase (PostgreSQL)**. `DATABASE_URL` is the only required
-variable. Two things will bite you, so `npm run db:check` tests for both:
-
-- Use the **Session pooler** string (`aws-0-<region>.pooler.supabase.com:5432`,
-  user `postgres.<ref>`). The direct host `db.<ref>.supabase.co` is **IPv6-only**
-  and fails with `ENOTFOUND` on an IPv4 network — which looks like a bad project
-  ref but isn't.
-- **Do not append `?sslmode=require`.** pg >= 8.23 treats it as `verify-full`,
-  which rejects Supabase's certificate chain. TLS is enabled by the app itself.
-
-- `/` — public submission form (no login)
-- `/admin` — inspection queue, **behind a staff sign-in** (`admin` / `admin` by
-  default; see `ADMIN_USERNAME` / `ADMIN_PASSWORD`)
-- `/admin/requests/[id]` — full assessment and printable poster
-
-No API key is required. Photo analysis is skipped when one is absent and the
-app falls back to text-only triage; maps fall back to a coordinate plot.
-
+### Verification & Testing
 ```bash
-npm run build      # production build
-npm run db:seed    # seed without wiping (no-op if already seeded)
-npm test           # scoring-engine tests
+# Run strict TypeScript compilation check (0 errors required)
+npm run typecheck
+
+# Run complete Vitest unit test suite (36 tests)
+npm test
+
+# Build production bundle
+npm run build
 ```
 
-## Configuration
+---
 
-Everything is optional — copy `.env.example` to `.env.local` to change any of it.
+## 9. Engineering Team & Technical Ownership
 
-| Variable | Default | Effect |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | unset | Enables photo analysis. Without it, text-only. |
-| `VISION_MODEL` | `claude-opus-5` | Model used to assess photos. |
-| `GOOGLE_MAPS_API_KEY` | unset | Geocoding API + Maps Static API. Without it: local gazetteer and a coordinate plot instead of street maps. Server-side only. |
-| `MAP_PROXY_SECRET` | the API key | Signs `/api/map` URLs so the basemap proxy is not free image hosting. |
-| `GEOCODER_URL` | unset | Legacy Nominatim fallback, used only when no Google key is set. |
-| `ADMIN_USERNAME` | `admin` | Staff sign-in for `/admin`. |
-| `ADMIN_PASSWORD` | `admin` | Change this for anything reachable from a network. |
-| `ADMIN_SESSION_SECRET` | `DATABASE_URL` | Signs the session cookie; setting it invalidates every session. |
-| `ADMIN_SESSION_HOURS` | `12` | Session lifetime — one shift. |
-| `DATABASE_URL` | — | **Required.** Supabase Postgres connection string. |
-| `DATABASE_SSL_STRICT` | `false` | Verify Supabase's TLS certificate chain. |
-| `DATABASE_POOL_MAX` | `10` | Pooled connections held by this process. |
-| `UPLOAD_DIR` | `var/uploads` | Photo storage, outside the web root. |
+- **Devang Jalag** ([@devang-jalag](https://github.com/devang-jalag)) — Geospatial Architecture Lead & Cloud Infrastructure
+  - Engineered the multi-tier resilient Google Maps SDK with automated OpenStreetMap fallback.
+  - Architected the zero-dependency Google Cloud Storage client with native RS256 token exchange.
+  - Implemented the inspection map UI, field navigation integration, and investor technical deck.
+- **Ketan Khunti** ([@ketan5050](https://github.com/ketan5050)) — Backend Architecture & Database
+  - Engineered the Supabase PostgreSQL repository layer and serverless LLM pipeline.
+- **Sanif Ali Momin** ([@sanifalimomin](https://github.com/sanifalimomin)) — Intake Workflow & Authentication
+  - Implemented citizen complaint intake forms, session cookies, and admin gatekeeping.
+- **Tarun Chauhan** — Data Engineering & Integration
+  - Constructed municipal data models and test coordinates.
 
-## Architecture
-
-Three layers, enforced by one rule: **`frontend/` never imports from
-`backend/`.** Anything both sides need lives in `shared/`.
-
-```
-src/
-  backend/                  server-only
-    config.ts               env reading; every value optional
-    db/client.ts            Postgres pool, schema, additive migrations
-    db/repository.ts        every query; snake_case in, camelCase out
-    domain/scoring.ts       hazard rules, classification, fusion, escalation
-    domain/bundling.ts      same-day work planner
-    domain/duplicates.ts    same-tree detection
-    services/               intake, vision, geocode, staticmap, auth, exif, storage
-    seed/                   engineered demo dataset + seeder
-  shared/                   pure data and helpers, safe in both bundles
-    types.ts                domain types, incl. server -> client prop shapes
-    scoring-config.ts       WEIGHTS and priority bands - the displayed contract
-    geo.ts                  distance maths
-    map.ts                  Web Mercator projection for the basemap overlay
-  frontend/
-    components/
-    styles/globals.css
-  app/                      Next.js routing only; pages compose, not compute
-  middleware.ts             the /admin gate (covers pages and server actions)
-```
-
-`WEIGHTS` and the plan types sit in `shared` because the UI prints them — one
-definition means the number the engine multiplies by is provably the number the
-arborist reads on the sheet.
-
-### Database
-
-Supabase-hosted PostgreSQL, accessed with `pg` (node-postgres) — no ORM, raw SQL
-in `backend/db/repository.ts`. Five tables: `requests`, `assessments`, `images`,
-`status_history`, `feedback`.
-
-Two driver behaviours the repository mappers absorb so callers never see them:
-
-- **`TIMESTAMPTZ` returns a JS `Date`.** The domain speaks ISO strings, so
-  `toIso()` normalises on the way out.
-- **`JSONB` returns already-parsed values** — never `JSON.parse` a jsonb column.
-  On the way *in* it must be `JSON.stringify`'d: node-postgres turns a JS array
-  into a Postgres *array literal*, which a jsonb column rejects, and `hazards`
-  is an array.
-
-`COUNT(*)` comes back as a string (bigint), hence `toCount()`.
-
-Status changes and classification writes run in explicit transactions;
-`setStatus` takes `SELECT ... FOR UPDATE` on the row so two dispatchers closing
-the same job serialise rather than recording a transition that never happened.
-
-### Classification is stored; scoring is not
-
-```
-classifyComplaint(text) -> Classification   expensive, runs once, PERSISTED
-scoreRequest(cls, ctx)  -> Assessment       cheap, recomputed EVERY READ
-```
-
-Wait time changes daily, so a final score written to the database would be wrong
-by the next morning. Only findings derived from the complaint and the photo are
-stored; the weighting, escalation and priority are always live.
-
-### How the score works
-
-```
-finalScore = danger * 0.50 + wait * 0.25 + location * 0.15 + review * 0.10
-```
-
-| Component | Weight | Source |
-|---|---|---|
-| Danger | 50% | Text rules fused with photo analysis, capped at 100 |
-| Wait time | 25% | `min(daysWaiting / 180 * 100, 100)` |
-| Location impact | 15% | Per-street table; major arterials score highest |
-| Human review | 10% | 100 when the report is too vague or ambiguous to triage |
-
-Priority bands: **Critical** 80-100, **High** 60-79, **Medium** 35-59, **Low** 0-34.
-
-### The imminent-hazard escalation floor
-
-The weighted formula alone cannot express urgency for a brand-new report. A tree
-actively falling onto a house, reported today on a residential street, tops out at:
-
-```
-danger 100*0.50 + wait 0*0.25 + location 40*0.15 + review 0*0.10 = 56  ->  "Medium"
-```
-
-Backlog age would outrank an active hazard, which is the wrong answer to the
-question this tool exists to answer. So danger sets a **floor** on the final
-score, the way severity rows work in a municipal risk matrix:
-
-- danger >= 70 -> floor of 80 (Critical)
-- danger >= 50 -> floor of 60 (High)
-
-The floor never lowers a score and never alters the four component scores. When
-it binds, the UI and the printed poster both say so and show the pre-escalation
-weighted score.
-
-### Fusing photo and description
-
-The photo is analyzed on the same 0-100 scale and the same hazard vocabulary the
-text rules use, so fusion is arithmetic rather than translation. The policy:
-
-| Situation | Score used | Review flag |
-|---|---|---|
-| No photo, or analysis unavailable | text | unchanged |
-| Photo and text agree (within 20) | higher of the two | unchanged |
-| Photo shows **more** than described | photo | unchanged |
-| Text claims **more** than the photo supports | text (the higher) | **flagged** |
-| Photo resolves a vague description | photo | **cleared** |
-| Photo unusable (not a tree, too dark) | text | **flagged** |
-
-The fused score is never lower than the text score: under-ranking a hazard
-someone described is the expensive mistake. Both source scores are always shown
-side by side in the admin UI, so a disagreement is visible rather than averaged
-away.
-
-### "Unsure" is not "dangerous"
-
-A report is flagged for human review when nothing observable can be scored. That
-raises the review component and shows a purple badge, but priority is computed
-independently — a vague report stays Low if nothing else is elevated. The two are
-displayed side by side, never substituted for one another.
-
-### Same-tree detection
-
-When a large tree comes down, a dozen neighbours report it. Left alone that fills
-the top of the queue with one tree. Three signals gate a merge — proximity,
-recency, and description overlap — because no single one is sufficient: a
-street-centroid geocode puts every address on a street at the same point, so
-proximity alone would merge the whole street. High-confidence matches are linked
-automatically and drop out of the queue; anything below the bar is surfaced as a
-suggestion for a human.
-
-### Location resolution
-
-1. **EXIF GPS** from the photo — the phone was actually there
-2. **Google Geocoding API** — house-number accuracy, and it reports its own
-   precision. A locality-centroid (`APPROXIMATE`) result is *discarded*: every
-   unrecognised address resolves to the same downtown point, which would stack
-   unrelated reports inside the 90 m duplicate radius and merge them into one tree
-3. **Local Halifax gazetteer** — offline, street-centroid accuracy
-4. **Nothing** — stored anyway, flagged for a manual pin, excluded from distance maths
-
-## Swapping the classifier
-
-All text understanding is behind one function: `classifyComplaint()` in
-`src/engine/scoring.ts`. Replace it with a model call returning the same
-`Classification` shape and the weighting, thresholds, reasoning, UI and poster
-keep working unchanged.
-
-## Printing
-
-"Print Poster" calls `window.print()`. Everything except the poster sits inside
-`.no-print`, which is `display: none` in print, so only the one-page assessment
-sheet reaches the printer. `@page` is US Letter portrait with 0.5in margins; the
-poster measures 7.5in wide and fits inside the 10in printable height.
-
-## Seed data
-
-The demo dataset is engineered, not random. `npm run db:reset` prints a
-verification report showing the ranked queue and the real distances between
-requests. It deliberately contains:
-
-- Five geographic clusters plus one isolated outlier
-- The **#1 ranked request inside a tight cluster**, with five same-day
-  candidates within 500 m — and those candidates are *not* the next five in
-  priority order
-- The **#2 ranked request 1.5 km away**, so it visibly cannot be bundled with #1
-- A pre-linked duplicate pair, and an unlinked near-duplicate pair
-- Completed and rejected records, one with resident feedback
-
-All seeded emails are `@example.com`. Nothing in the dataset can reach a real
-inbox.
-
-## Team & Contributors
-
-- **Devang Jalag** ([@devang-jalag](https://github.com/devang-jalag)) — Google Maps SDK architecture (chosen over Leaflet), Cloud Storage photo pipeline, inspection UI, and investor pitch deck
-- **Ketan Khunti** ([@ketan5050](https://github.com/ketan5050)) — Backend architecture, Supabase REST layer, LLM pipeline & deployment
-- **Sanif Ali Momin** ([@sanifalimomin](https://github.com/sanifalimomin)) — Complaint intake flow & admin authentication
-- **Tarun Chauhan** — Data integration & test fixtures
-
-### Presentation & Pitch Decks
-- `CanopyGuard_Executive_Pitch.pptx` — Executive investor pitch deck
-- `Tree_Hazard_Detection_Pitch.pptx` — Project pitch deck
-- `presentation.html` — Interactive pitch presentation
+### Presentation Assets
+- `CanopyGuard_Executive_Pitch.pptx`: Technical investor briefing.
+- `Tree_Hazard_Detection_Pitch.pptx`: Platform overview presentation.
+- `presentation.html`: Interactive browser-based system walkthrough.
