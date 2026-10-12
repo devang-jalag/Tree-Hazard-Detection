@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { fixtures } from "@/backend/seed/fixtures";
 import {
+  ENGINE_VERSION,
   applyEscalation,
   assess,
   calculateDangerScore,
@@ -205,7 +206,7 @@ describe("classification is stable and storable", () => {
   });
 
   it("stamps the engine version so stale rows can be found later", () => {
-    expect(classifyComplaint("Tree looks weird.").engineVersion).toBe("text-v1");
+    expect(classifyComplaint("Tree looks weird.").engineVersion).toBe(ENGINE_VERSION);
   });
 
   it("produces the same score for the same inputs regardless of clock", () => {

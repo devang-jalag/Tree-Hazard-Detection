@@ -1,10 +1,12 @@
 "use client";
 
+import { useState } from "react";
 import Link from "next/link";
 import {
   ArrowLeft,
   Camera,
   Copy,
+  ExternalLink,
   History,
   MapPin,
   MessageSquare,
@@ -42,7 +44,9 @@ function LocationMap({
   request: ScoredRequest;
   basemap: StaticMapImage | null;
 }) {
+  const [mapError, setMapError] = useState(false);
   const located = request.latitude !== null && request.longitude !== null;
+  const showBasemap = basemap && !mapError;
 
   return (
     <div className="border border-slate-200">
@@ -54,11 +58,12 @@ function LocationMap({
             : "4 / 3",
         }}
       >
-        {basemap ? (
+        {showBasemap ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img
             src={basemap.src}
             alt={`Map of ${request.address}`}
+            onError={() => setMapError(true)}
             className="absolute inset-0 h-full w-full object-cover"
           />
         ) : (
@@ -95,12 +100,34 @@ function LocationMap({
       {/* Below the raster, not over it: Google's attribution sits along the
           bottom edge of the image and has to stay legible. */}
       <div className="border-t border-slate-200 bg-white px-3 py-2">
-        <p className="text-xs font-semibold text-slate-900">{request.address}</p>
-        <p className="font-mono text-[10px] text-slate-500">
-          {located
-            ? `${request.latitude!.toFixed(4)}, ${request.longitude!.toFixed(4)} · ${request.locationSource}`
-            : "No coordinates on file"}
-        </p>
+        <div className="flex items-start justify-between gap-2">
+          <div>
+            <p className="text-xs font-semibold text-slate-900">{request.address}</p>
+            <p className="font-mono text-[10px] text-slate-500">
+              {located
+                ? `${request.latitude!.toFixed(4)}, ${request.longitude!.toFixed(4)} · ${request.locationSource}`
+                : "No coordinates on file"}
+            </p>
+          </div>
+          <span className="shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-[9px] font-medium text-slate-500">
+            {showBasemap ? "Google Maps" : "Offline Failsafe"}
+          </span>
+        </div>
+
+        {located && (
+          <div className="mt-2.5 flex items-center justify-between border-t border-slate-100 pt-2">
+            <a
+              href={`https://www.google.com/maps/search/?api=1&query=${request.latitude},${request.longitude}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 hover:text-emerald-800 hover:underline"
+            >
+              <ExternalLink className="h-3 w-3" aria-hidden />
+              Open in Google Maps ↗
+            </a>
+            <span className="text-[10px] text-slate-400">Arborist Navigation</span>
+          </div>
+        )}
       </div>
     </div>
   );

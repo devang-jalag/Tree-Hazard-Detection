@@ -26,6 +26,9 @@ export async function GET(
   let bytes: Buffer | null = null;
 
   if (image.data) {
+    if (image.data.startsWith("http://") || image.data.startsWith("https://")) {
+      return NextResponse.redirect(image.data, 307);
+    }
     bytes = Buffer.from(image.data, "base64");
   } else if (image.mimeType === PLACEHOLDER_MIME) {
     const request = await getRequest(image.requestId);

@@ -25,6 +25,7 @@ import {
   filenameFor,
   newImageId,
 } from "@/backend/services/storage";
+import { uploadImageToGCS } from "@/backend/services/gcs";
 import type { Classification, RequestStatus } from "@/shared/types";
 import {
   analyzeHazard,
@@ -183,13 +184,21 @@ export async function submitRequest(
   if (photo) {
     const imageId = newImageId();
     const filename = filenameFor(imageId, photo.mimeType);
+
+    // Try Google Cloud Storage first; fallback to base64 in DB
+    const gcsUrl = await uploadImageToGCS({
+      filename,
+      data: photo.data,
+      contentType: photo.mimeType,
+    });
+
     await insertImage({
       id: imageId,
       requestId: id,
       filename,
       mimeType: photo.mimeType,
       byteSize: photo.data.byteLength,
-      data: photo.data.toString("base64"),
+      data: gcsUrl ?? photo.data.toString("base64"),
       exifLatitude: exif?.latitude ?? null,
       exifLongitude: exif?.longitude ?? null,
     });

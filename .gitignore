@@ -35,5 +35,11 @@ backend/.env
 
 # Temp upload files
 backend/uploads/
+uploads/
 var/
 tsconfig.tsbuildinfo
+
+# Cloud Credentials & Service Accounts
+*service-account*.json
+*.pem
+*.key
